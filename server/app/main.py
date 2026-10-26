@@ -34,6 +34,8 @@ from .pipeline import (
     sha256_file,
     snapshot,
     source_payload,
+    extract_document_metadata,
+    refresh_indexed_metadata,
     refresh_review_document,
     split_document_blocks,
     store_parsed_document,
@@ -84,6 +86,7 @@ def recover_interrupted_jobs() -> None:
 def worker_loop() -> None:
     while not _stop.is_set():
         doc_id = None
+        job = "build"
         with SessionLocal() as db:
             doc = db.scalar(select(Document).where(Document.status == "queued").limit(1))
             if doc is not None:
@@ -91,6 +94,11 @@ def worker_loop() -> None:
                 doc.updated_at = utcnow()
                 db.commit()
                 doc_id = doc.id
+            else:
+                pending = db.scalar(select(Document).where(Document.status == "ready", Document.metadata_status.in_(["pending", ""])).limit(1))
+                if pending is not None:
+                    doc_id = pending.id
+                    job = "metadata"
         if not doc_id:
             _stop.wait(0.4)
             continue
@@ -99,7 +107,10 @@ def worker_loop() -> None:
             if current is None:
                 continue
             try:
-                build_document(db, current)
+                if job == "metadata":
+                    refresh_indexed_metadata(db, current)
+                else:
+                    build_document(db, current)
             except Exception as exc:
                 current.status = "failed"
                 current.error = str(exc)[:500]
@@ -501,8 +512,15 @@ def reextract_document_metadata(doc_id: str, _role: str = Depends(require_manage
     doc = db.get(Document, doc_id)
     if doc is None:
         raise HTTPException(404, "文档不存在。")
+    if doc.status == "indexing":
+        raise HTTPException(409, "文档正在构建，请稍后再抽取。")
     if not doc.chunks:
         raise HTTPException(400, "文档尚未解析出可索引内容。")
+    if doc.status == "review":
+        extract_document_metadata(db, doc)
+        doc.updated_at = utcnow()
+        db.commit()
+        return snapshot(db)
     doc.metadata_status = "pending"
     doc.metadata_model = ""
     doc.metadata_error = ""

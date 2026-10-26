@@ -63,36 +63,25 @@ def extract_metadata_rules(name: str, content: str) -> dict:
         version_matches = re.findall(r"(?<!\w)(V\d+(?:\.\d+){0,3})(?!\w)", f"{name}\n{sample}", re.I)
     owner_matches = re.findall(r"(?:负责人|责任人|归口部门|负责部门|编制部门|发布部门)\s*[:：]\s*([^\n，,；;]{2,40})", sample)
     headings = []
-    for line in sample.splitlines()[:120]:
-        text = re.sub(r"^\s*(?:#{1,6}|[一二三四五六七八九十]+[、.]|\d+[、.])\s*", "", line).strip()
-        if 2 <= len(text) <= 24 and not any(mark in text for mark in ("|", "：", ":", "。", "；")):
+    for line in sample.splitlines()[:80]:
+        raw = line.strip()
+        if not raw or raw.startswith("|"):
+            continue
+        text = re.sub(r"^\s*(?:#{1,6}\s+|[一二三四五六七八九十]+[、.]\s*|\d+[、.]\s*)", "", raw).strip()
+        if text != raw and 2 <= len(text) <= 24 and not any(mark in text for mark in ("|", "：", ":", "。", "；")):
             headings.append(text)
-    subjects = [stem] + headings[:3]
-    common = [
-        "年假", "请假", "报销", "审批", "差旅", "发票", "合同", "权限", "角色", "员工",
-        "客户服务", "响应时限", "工单", "设备", "资产", "产品", "安全", "版本", "负责人",
-    ]
-    keywords = [term for term in common if term in f"{name}\n{sample}"]
-    keywords = [stem, *headings[:5], *keywords]
-    base = normalize_metadata({
+    keywords = []
+    for item in [stem, *headings]:
+        if item and item not in keywords:
+            keywords.append(item)
+    return normalize_metadata({
         "documentDate": date_matches[0] if date_matches else "",
         "version": version_matches[0] if version_matches else "",
-        "subjects": subjects,
+        "subjects": [stem] if stem else [],
         "owners": owner_matches,
         "keywords": keywords,
         "questions": [],
     })
-    topic = base["subjects"][0] if base["subjects"] else stem or "这份文档"
-    questions = [f"{topic}主要讲什么？"]
-    if base["documentDate"]:
-        questions.append(f"{topic}的发布时间或生效时间是什么？")
-    if base["version"]:
-        questions.append(f"{topic}当前是什么版本？")
-    if base["owners"] or "负责" in sample:
-        questions.append(f"{topic}由谁负责？")
-    questions.extend(f"{keyword}有哪些规则或要求？" for keyword in base["keywords"][1:5])
-    base["questions"] = normalize_metadata({"questions": questions})["questions"]
-    return base
 
 
 def metadata_index_text(doc: Document) -> str:
@@ -315,11 +304,7 @@ def store_parsed_document(db: Session, kb: KnowledgeBase, *, name: str, path, ra
         doc.content = "\n\n".join(text for text, _location in pieces)
         doc.source_label = pieces[0][1]
         doc.chunks = [Chunk(id=new_id("chunk"), position=index, content=text, location=location) for index, (text, location) in enumerate(pieces)]
-        doc.metadata_json = json.dumps(extract_metadata_rules(name, doc.content), ensure_ascii=False)
-        doc.metadata_status = "draft"
-        doc.metadata_model = "本机规则"
-        doc.metadata_error = ""
-        doc.metadata_updated_at = utcnow()
+        extract_document_metadata(db, doc)
     except (ParseError, ParseNeed, ProviderError) as exc:
         doc.status = "failed"
         doc.error = str(exc)
@@ -341,11 +326,8 @@ def refresh_review_document(db: Session, kb: KnowledgeBase, doc: Document, path,
         doc.content = "\n\n".join(text for text, _location in pieces)
         doc.source_label = pieces[0][1]
         doc.chunks = [Chunk(id=new_id("chunk"), document_id=doc.id, position=index, content=text, location=location) for index, (text, location) in enumerate(pieces)]
-        doc.metadata_json = json.dumps(extract_metadata_rules(name, doc.content), ensure_ascii=False)
-        doc.metadata_status = "draft"
-        doc.metadata_model = "本机规则"
-        doc.metadata_error = ""
-        doc.metadata_updated_at = utcnow()
+        if doc.metadata_status != "edited":
+            extract_document_metadata(db, doc)
         doc.status = "review"
         doc.error = ""
     except (ParseError, ParseNeed, ProviderError) as exc:
@@ -396,14 +378,8 @@ def _ocr_blocks(db: Session, path, name: str) -> tuple[list[Block], int] | None:
     return blocks, max(pages or [1])
 
 
-def build_document(db: Session, doc: Document) -> None:
-    doc.status = "indexing"
-    doc.error = ""
-    doc.updated_at = utcnow()
-    db.commit()
+def apply_embeddings(db: Session, doc: Document, *, clear_without_model: bool = True) -> str | None:
     kb = db.get(KnowledgeBase, doc.kb_id)
-    if doc.metadata_status in {"pending", "draft", "failed", ""}:
-        extract_document_metadata(db, doc)
     embedder = None
     if kb and kb.embedding_id:
         row = db.get(ModelConfig, kb.embedding_id)
@@ -411,31 +387,74 @@ def build_document(db: Session, doc: Document) -> None:
             embedder = ModelRow.from_orm(row)
     if embedder is None:
         embedder = default_model(db, "Embedding")
-    mode = "关键词"
-    if embedder is not None:
-        from .providers import embed_texts
+    if embedder is None:
+        if clear_without_model:
+            for chunk in doc.chunks:
+                chunk.embedding = ""
+                chunk.embedding_model = ""
+            doc.index_mode = "关键词"
+        elif any(chunk.embedding for chunk in doc.chunks):
+            model_name = next((chunk.embedding_model for chunk in doc.chunks if chunk.embedding_model), "")
+            doc.index_mode = f"元数据关键词 + {model_name}" if model_name else "关键词"
+        else:
+            doc.index_mode = "关键词"
+        return None
+    from .providers import embed_texts
 
-        metadata_text = metadata_index_text(doc)
-        texts = [f"{metadata_text}\n\n正文片段：\n{chunk.content}" if metadata_text else chunk.content for chunk in doc.chunks]
-        try:
-            vectors, _usage = embed_texts(embedder, texts) if texts else ([], Usage())
-        except ProviderError as exc:
-            doc.status = "failed"
-            doc.error = f"向量化失败：{exc.message}"
-            doc.updated_at = utcnow()
-            db.commit()
-            return
-        for chunk, vector in zip(doc.chunks, vectors):
-            chunk.embedding = json.dumps(vector)
-            chunk.embedding_model = embedder.model
-        mode = f"元数据关键词 + {embedder.model}"
-    else:
-        for chunk in doc.chunks:
-            chunk.embedding = ""
-            chunk.embedding_model = ""
-    doc.index_mode = mode
+    metadata_text = metadata_index_text(doc)
+    texts = [f"{metadata_text}\n\n正文片段：\n{chunk.content}" if metadata_text else chunk.content for chunk in doc.chunks]
+    try:
+        vectors, _usage = embed_texts(embedder, texts) if texts else ([], Usage())
+    except ProviderError as exc:
+        return exc.message
+    for chunk, vector in zip(doc.chunks, vectors):
+        chunk.embedding = json.dumps(vector)
+        chunk.embedding_model = embedder.model
+    doc.index_mode = f"元数据关键词 + {embedder.model}"
+    return None
+
+
+def build_document(db: Session, doc: Document) -> None:
+    doc.status = "indexing"
+    doc.error = ""
+    doc.updated_at = utcnow()
+    db.commit()
+    if doc.metadata_status in {"pending", "failed", ""}:
+        extract_document_metadata(db, doc)
+    error = apply_embeddings(db, doc)
+    if error:
+        doc.status = "failed"
+        doc.error = f"向量化失败：{error}"
+        doc.updated_at = utcnow()
+        db.commit()
+        return
     doc.status = "ready"
     doc.updated_at = utcnow()
+    kb = db.get(KnowledgeBase, doc.kb_id)
+    if kb:
+        kb.updated_at = utcnow()
+    db.commit()
+
+
+def refresh_indexed_metadata(db: Session, doc: Document) -> None:
+    if doc.status != "ready" or doc.metadata_status not in {"pending", ""}:
+        return
+    try:
+        extract_document_metadata(db, doc)
+        error = apply_embeddings(db, doc, clear_without_model=False)
+        if error:
+            extra = f"向量索引未刷新：{error}"
+            doc.metadata_error = f"{doc.metadata_error} {extra}".strip() if doc.metadata_error else extra
+    except Exception as exc:
+        fallback = extract_metadata_rules(doc.name, doc.content or "")
+        doc.metadata_json = json.dumps(fallback, ensure_ascii=False)
+        doc.metadata_status = "fallback"
+        doc.metadata_model = "本机规则"
+        doc.metadata_error = f"自动抽取未完成，已使用本机规则：{str(exc)[:180]}"
+        doc.metadata_updated_at = utcnow()
+    doc.status = "ready"
+    doc.updated_at = utcnow()
+    kb = db.get(KnowledgeBase, doc.kb_id)
     if kb:
         kb.updated_at = utcnow()
     db.commit()

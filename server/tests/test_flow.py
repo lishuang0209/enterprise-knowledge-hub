@@ -291,7 +291,8 @@ def test_document_metadata_is_indexed_without_replacing_source():
     assert rules["documentDate"].startswith("2026-09")
     assert "2.1" in rules["version"]
     assert any("安全中心" in item for item in rules["owners"])
-    assert rules["keywords"] and rules["questions"]
+    assert "信誉分" in rules["keywords"]
+    assert rules["questions"] == []
     with TestClient(app) as client:
         created = client.post("/api/knowledge-bases", headers={"X-Role": "manager"}, json={"name": "元数据索引", "description": "", "category": "通用知识", "tags": []})
         kb_id = next(item["id"] for item in created.json()["knowledgeBases"] if item["name"] == "元数据索引")
@@ -299,7 +300,7 @@ def test_document_metadata_is_indexed_without_replacing_source():
         preview = client.post("/api/documents/preview", headers={"X-Role": "manager"}, data={"kbId": kb_id}, files={"files": ("信誉分规则.md", io.BytesIO(content.encode()), "text/markdown")})
         assert preview.status_code == 200, preview.text
         document = preview.json()["documents"][0]
-        assert document["metadataStatus"] == "draft"
+        assert document["metadataStatus"] == "fallback"
         assert document["metadata"]["documentDate"].startswith("2026-09")
         assert document["metadata"]["owners"]
         revised = client.patch(f"/api/documents/{document['id']}/metadata", headers={"X-Role": "manager"}, json={
@@ -323,7 +324,10 @@ def test_document_metadata_is_indexed_without_replacing_source():
 
 
 def test_metadata_model_failure_keeps_local_rules(monkeypatch):
+    calls = {"n": 0}
+
     def broken(*_args, **_kwargs):
+        calls["n"] += 1
         raise RuntimeError("模型超时")
 
     monkeypatch.setattr("app.pipeline.generate_with_langchain", broken)
@@ -336,7 +340,10 @@ def test_metadata_model_failure_keeps_local_rules(monkeypatch):
         created = client.post("/api/knowledge-bases", headers={"X-Role": "manager"}, json={"name": "元数据降级", "description": "", "category": "通用知识", "tags": []})
         kb_id = next(item["id"] for item in created.json()["knowledgeBases"] if item["name"] == "元数据降级")
         preview = client.post("/api/documents/preview", headers={"X-Role": "manager"}, data={"kbId": kb_id}, files={"files": ("制度.md", io.BytesIO("负责人：行政部\n年假需提前申请。".encode()), "text/markdown")})
-        doc_id = preview.json()["documents"][0]["id"]
+        parsed = preview.json()["documents"][0]
+        doc_id = parsed["id"]
+        assert parsed["metadataStatus"] == "fallback"
+        assert calls["n"] == 1
         assert client.post("/api/documents/build", headers={"X-Role": "manager"}, json={"ids": [doc_id]}).status_code == 200
         ready = _wait_ready(client, doc_id)
         assert ready["status"] == "ready"
@@ -344,6 +351,46 @@ def test_metadata_model_failure_keeps_local_rules(monkeypatch):
         assert ready["metadataModel"] == "本机规则"
         assert "本机规则" in ready["metadataError"]
         assert any("行政部" in item for item in ready["metadata"]["owners"])
+        assert calls["n"] == 1
+
+
+def test_import_extracts_metadata_before_build(monkeypatch):
+    calls = {"n": 0}
+
+    def generated(*_args, **_kwargs):
+        calls["n"] += 1
+        payload = json.dumps({
+            "documentDate": "2026-09-01", "version": "V2.1", "subjects": ["信誉分"],
+            "owners": ["安全中心"], "keywords": ["星港调度"], "questions": ["星港调度怎么申请？"],
+        }, ensure_ascii=False)
+        yield payload, None
+
+    monkeypatch.setattr("app.pipeline.generate_with_langchain", generated)
+    monkeypatch.setattr("app.pipeline.default_model", lambda _db, kind: ModelRow(
+        id="llm", provider="通义", kind="LLM", name="测试对话", model="qwen-test",
+        base_url="https://example.com/v1", enabled=True, is_default=True, dimensions=0,
+        status="verified", secret="sk-test", has_credential=True,
+    ) if kind == "LLM" else None)
+    with TestClient(app) as client:
+        created = client.post("/api/knowledge-bases", headers={"X-Role": "manager"}, json={"name": "导入即抽取", "description": "", "category": "通用知识", "tags": []})
+        kb_id = next(item["id"] for item in created.json()["knowledgeBases"] if item["name"] == "导入即抽取")
+        content = "更新日期：2026-09-01\n版本：V2.1\n负责人：安全中心\n每个账号满分 100 分。\n"
+        preview = client.post("/api/documents/preview", headers={"X-Role": "manager"}, data={"kbId": kb_id}, files={"files": ("信誉分规则.md", io.BytesIO(content.encode()), "text/markdown")})
+        assert preview.status_code == 200, preview.text
+        document = preview.json()["documents"][0]
+        assert document["status"] == "review"
+        assert document["metadataStatus"] == "ready"
+        assert document["metadata"]["keywords"] == ["星港调度"]
+        assert calls["n"] == 1
+        assert client.post("/api/documents/build", headers={"X-Role": "manager"}, json={"ids": [document["id"]]}).status_code == 200
+        ready = _wait_ready(client, document["id"])
+        assert ready["metadataStatus"] == "ready"
+        assert ready["metadata"]["keywords"] == ["星港调度"]
+        assert calls["n"] == 1
+        found = client.post(f"/api/knowledge-bases/{kb_id}/retrieve", headers={"X-Role": "manager"}, json={"question": "星港调度怎么申请？", "limit": 3})
+        hits = found.json()["hits"]
+        assert hits and any("满分" in hit["content"] for hit in hits)
+        assert all("星港调度" not in hit["content"] for hit in hits)
 
 
 def test_one_provider_key_fills_three_services():
